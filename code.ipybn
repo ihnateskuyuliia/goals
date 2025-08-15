@@ -1,0 +1,676 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Arc, Rectangle, Circle
+
+def draw_pitch(ax, lw=0.8):
+    ''' 
+    Draw a FIFA PITCH pitch.
+    '''
+    L = 105.0
+    W = 68.0
+    half_L = L / 2.0   # 52.5
+    half_W = W / 2.0   # 34.0
+    goal_area_depth = 5.5        
+    goal_area_width = 18.32      
+    pen_area_depth = 16.5        
+    pen_area_width = 40.32       
+    pen_spot_dist = 11.0         
+    center_circle_r = 9.15
+    goal_width = 7.32
+    corner_r = 1.0
+    
+    # Outer boundary
+    ax.add_patch(Rectangle((-half_L, -half_W), L, W, fill=False, lw=lw, edgecolor='black'))
+    # Halfway line
+    ax.plot([0, 0], [-half_W, half_W], color='black', lw=lw)
+    # Center circle + center spot
+    ax.add_patch(Circle((0, 0), center_circle_r, fill=False, lw=lw))
+    ax.add_patch(Circle((0, 0), 0.2, color='black'))
+    # Penalty areas
+    ax.add_patch(Rectangle((-half_L, -pen_area_width/2.0), pen_area_depth, pen_area_width, fill=False, lw=lw))
+    ax.add_patch(Rectangle((half_L - pen_area_depth, -pen_area_width/2.0), pen_area_depth, pen_area_width, fill=False, lw=lw))
+    # Goal areas
+    ax.add_patch(Rectangle((-half_L, -goal_area_width/2.0), goal_area_depth, goal_area_width, fill=False, lw=lw))
+    ax.add_patch(Rectangle((half_L - goal_area_depth, -goal_area_width/2.0), goal_area_depth, goal_area_width, fill=False, lw=lw))
+    # Penalty spots
+    left_pen_spot = -half_L + pen_spot_dist
+    right_pen_spot = half_L - pen_spot_dist
+    ax.add_patch(Circle((left_pen_spot, 0), 0.2, color='black'))
+    ax.add_patch(Circle((right_pen_spot, 0), 0.2, color='black'))
+    # Goal posts
+    for y in [-goal_width/2.0, goal_width/2.0]:
+        ax.plot(-half_L, y, 'ko', markersize=4)
+        ax.plot(half_L, y, 'ko', markersize=4)
+    
+    ax.set_xlim(-half_L - 3, half_L + 3)
+    ax.set_ylim(-half_W - 3, half_W + 3)
+    ax.set_aspect('equal')
+    ax.axis('off')
+
+def find_goal_line_crossings(tracks, team_id=515):
+    '''
+    Find ALL instances where the ball crosses the goal line with team = 515 possession
+    '''
+    goal_crossings = []
+    
+    # FIRST HALF (attacking towards +x (goal line at 52.5))
+    first_half = tracks[tracks['period'] == 1]
+    ball_crosses_1st = first_half[
+        (first_half['player_id'] == -1) &
+        (first_half['pos_x'] > 52.5) &
+        (first_half['possessing_team_id'] == team_id)
+    ]
+    
+    if len(ball_crosses_1st) > 0:
+        # Group consecutive frames
+        ball_crosses_1st = ball_crosses_1st.sort_values('frame_count')
+        ball_crosses_1st['group'] = (ball_crosses_1st['frame_count'].diff() > 15).cumsum()
+        
+        for group_id, group_df in ball_crosses_1st.groupby('group'):
+            start_frame = group_df['frame_count'].min()
+            end_frame = group_df['frame_count'].max()
+            
+            crossing = {
+                'period': 1,
+                'start_frame': start_frame,
+                'end_frame': end_frame,
+                'ball_positions': group_df[['frame_count', 'pos_x', 'pos_y', 'pos_z']].values.tolist(),
+                'attacking_direction': 'positive_x'
+            }
+            goal_crossings.append(crossing)
+    
+    # SECOND HALF (attacking towards -x (goal line at -52.5))
+    second_half = tracks[tracks['period'] == 2]
+    ball_crosses_2nd = second_half[
+        (second_half['player_id'] == -1) &
+        (second_half['pos_x'] < -52.5) &
+        (second_half['possessing_team_id'] == team_id)
+    ]
+    
+    if len(ball_crosses_2nd) > 0:
+        # Group consecutive frames
+        ball_crosses_2nd = ball_crosses_2nd.sort_values('frame_count')
+        ball_crosses_2nd['group'] = (ball_crosses_2nd['frame_count'].diff() > 15).cumsum()
+        
+        for group_id, group_df in ball_crosses_2nd.groupby('group'):
+            start_frame = group_df['frame_count'].min()
+            end_frame = group_df['frame_count'].max()
+            
+            crossing = {
+                'period': 2,
+                'start_frame': start_frame,
+                'end_frame': end_frame,
+                'ball_positions': group_df[['frame_count', 'pos_x', 'pos_y', 'pos_z']].values.tolist(),
+                'attacking_direction': 'negative_x'
+            }
+            goal_crossings.append(crossing)
+    
+    return goal_crossings
+
+def classify_shot_outcome(shot):
+    """
+    Classify shot outcome including wide shots that don't cross goal line
+    """
+    goal_width = 7.32
+    goal_height = 2.44
+    goal_y_min = -goal_width/2  # -3.66
+    goal_y_max = goal_width/2   # +3.66
+    
+    # Off target range: within 2m of goal posts
+    off_target_y_min = goal_y_min - 2.0  # -5.66
+    off_target_y_max = goal_y_max + 2.0  # +5.66
+    
+    period = shot['period']
+    crossed_goal_line = False
+    goal_line_crossings = []
+    
+    # Check if ball crossed goal line and get positions
+    for frame_count, pos_x, pos_y, pos_z in shot['ball_positions']:
+        if period == 1 and pos_x >= 52.5:  # First half goal line
+            crossed_goal_line = True
+            goal_line_crossings.append((pos_y, pos_z))
+        elif period == 2 and pos_x <= -52.5:  # Second half goal line
+            crossed_goal_line = True
+            goal_line_crossings.append((pos_y, pos_z))
+    
+    if crossed_goal_line:
+        # Ball crossed goal line - check where
+        for pos_y, pos_z in goal_line_crossings:
+            if goal_y_min <= pos_y <= goal_y_max and pos_z <= goal_height:
+                return 'Goal'
+            elif off_target_y_min <= pos_y <= off_target_y_max:
+                if pos_z > goal_height:
+                    return 'Off Target (Over)'
+                else:
+                    return 'Off Target'
+            else:
+                return 'Wide'
+    else:
+        # Ball didn't cross goal line - check final position
+        final_pos = shot['ball_positions'][-1]
+        final_y = final_pos[2]  # pos_y
+        
+        if abs(final_y) > 10:  # Very wide
+            return 'Wide'
+        elif period == 1 and shot.get('max_x', 0) > 50:  # Got close to goal
+            return 'Off Target'
+        elif period == 2 and shot.get('min_x', 0) < -50:  # Got close to goal
+            return 'Off Target'
+        else:
+            return 'Blocked'
+
+def check_player_3531_involvement(tracks, crossing, player_id=3531, lookback_frames=75):
+    """
+    Check if player 3531 was the LAST player to touch the ball IMMEDIATELY before goal line crossing
+    """
+    start_frame = crossing['start_frame']
+    period = crossing['period']
+    
+    # Look back only 3 seconds (75 frames at 25fps) - must be immediate involvement
+    analysis_start = start_frame - lookback_frames
+    analysis_end = start_frame - 1  # Stop just before goal line crossing
+    
+    period_data = tracks[tracks['period'] == period]
+    analysis_frames = range(analysis_start, analysis_end + 1)
+    
+    # Get player and ball data for this window
+    player_data = period_data[
+        (period_data['player_id'] == player_id) &
+        (period_data['frame_count'].isin(analysis_frames))
+    ]
+    
+    ball_data = period_data[
+        (period_data['player_id'] == -1) &
+        (period_data['frame_count'].isin(analysis_frames))
+    ]
+    
+    if len(player_data) == 0 or len(ball_data) == 0:
+        return False, None, None
+    
+    # Find the LAST time player was very close to ball (within 1.5m for actual touch)
+    close_moments = []
+    
+    for _, player_row in player_data.iterrows():
+        frame = player_row['frame_count']
+        ball_row = ball_data[ball_data['frame_count'] == frame]
+        
+        if len(ball_row) > 0:
+            ball_row = ball_row.iloc[0]
+            distance = np.sqrt((player_row['pos_x'] - ball_row['pos_x'])**2 + 
+                             (player_row['pos_y'] - ball_row['pos_y'])**2)
+            
+            if distance <= 1.5:  # Very close - actual contact with ball
+                close_moments.append((frame, distance))
+    
+    if not close_moments:
+        return False, None, None
+    
+    # Take the LAST close moment (most recent touch before goal)
+    close_moments.sort(key=lambda x: x[0])  # Sort by frame
+    last_touch_frame, last_distance = close_moments[-1]
+    
+    # Additional check: the touch must be within the last 50 frames (2 seconds)
+    if start_frame - last_touch_frame > 50:
+        return False, None, None  # Too long ago, not immediate involvement
+    
+    return True, last_touch_frame, last_distance
+
+def classify_outcome(crossing):
+    """
+    Classify shot outcome with strict off-target criteria (within 2m of goal)
+    """
+    goal_width = 7.32
+    goal_height = 2.44  # Goal crossbar height
+    goal_y_min = -goal_width/2  # -3.66
+    goal_y_max = goal_width/2   # +3.66
+    
+    # Off target range: within 2m of goal posts
+    off_target_y_min = goal_y_min - 2.0  # -5.66
+    off_target_y_max = goal_y_max + 2.0  # +5.66
+    
+    # Check all ball positions in the crossing
+    for frame_count, pos_x, pos_y, pos_z in crossing['ball_positions']:
+        # Check if ball went over the goal (too high)
+        if pos_z > goal_height:
+            # Check if it was close enough horizontally to be "off target"
+            if off_target_y_min <= pos_y <= off_target_y_max:
+                return 'Off Target (Over)'
+            else:
+                return 'Wide'
+        
+        # Check if ball was within goal posts horizontally
+        if goal_y_min <= pos_y <= goal_y_max:
+            # Within goal posts - check height
+            if pos_z <= goal_height:
+                return 'Goal'
+            else:
+                return 'Off Target (Over)'
+        
+        # Check if ball was close to goal (within 2m of posts)
+        elif off_target_y_min <= pos_y <= off_target_y_max:
+            # Close to goal but missed
+            if pos_z <= goal_height:
+                return 'Off Target'
+            else:
+                return 'Off Target (Over)'
+        
+        # Ball was far from goal
+        else:
+            return 'Wide'
+    
+    return 'Wide'
+
+def visualize_crossing(tracks, crossing, player_involvement=None):
+    """
+    Visualize a goal line crossing
+    """
+    period = crossing['period']
+    start_frame = crossing['start_frame']
+    end_frame = crossing['end_frame']
+    
+    # Get data for visualization (extended window)
+    viz_start = start_frame - 100
+    viz_end = end_frame + 20
+    
+    period_data = tracks[tracks['period'] == period]
+    viz_data = period_data[
+        (period_data['frame_count'] >= viz_start) &
+        (period_data['frame_count'] <= viz_end)
+    ]
+    
+    ball_data = viz_data[viz_data['player_id'] == -1]
+    player_data = viz_data[viz_data['player_id'] == 3531]
+    
+    # Create plot
+    fig, ax = plt.subplots(figsize=(14, 10))
+    draw_pitch(ax)
+    
+    # Plot ball trajectory
+    ax.plot(ball_data['pos_x'], ball_data['pos_y'], 'b-', linewidth=1, alpha=0.7, label='Ball path')
+    
+    # Highlight goal line crossing
+    crossing_frames = range(start_frame, end_frame + 1)
+    crossing_ball = ball_data[ball_data['frame_count'].isin(crossing_frames)]
+    ax.scatter(crossing_ball['pos_x'], crossing_ball['pos_y'], 
+              c='blue', s=60, label='Ball at goal line', edgecolor='darkblue', linewidth=1)
+    
+    # Plot player movement
+    if len(player_data) > 0:
+        ax.plot(player_data['pos_x'], player_data['pos_y'], 'r-', linewidth=2, label='Player 3531')
+        
+        # Highlight involvement point if found
+        if player_involvement and player_involvement[0]:  # player_involved = True
+            involvement_frame = player_involvement[1]
+            involvement_distance = player_involvement[2]
+            
+            involvement_player = player_data[player_data['frame_count'] == involvement_frame]
+            involvement_ball = ball_data[ball_data['frame_count'] == involvement_frame]
+            
+            if len(involvement_player) > 0:
+                ax.scatter(involvement_player['pos_x'], involvement_player['pos_y'], 
+                          c='red', s=200, marker='*', label=f'Player involvement (Frame {involvement_frame})',
+                          edgecolor='black', linewidth=2)
+            
+            if len(involvement_ball) > 0:
+                ax.scatter(involvement_ball['pos_x'], involvement_ball['pos_y'], 
+                          c='green', s=150, marker='*', label=f'Ball at involvement ({involvement_distance:.1f}m)',
+                          edgecolor='black', linewidth=1)
+    
+    # Add goal line markers
+    if period == 1:
+        ax.axvline(x=52.5, color='orange', linestyle='--', linewidth=2, alpha=0.7, label='Goal line (52.5)')
+    else:
+        ax.axvline(x=-52.5, color='orange', linestyle='--', linewidth=2, alpha=0.7, label='Goal line (-52.5)')
+    
+    outcome = classify_outcome(crossing)
+    
+    ax.set_title(f"Goal Line Crossing - Period {period} - Frames {start_frame}-{end_frame} - Outcome: {outcome}", 
+                fontsize=14, fontweight='bold')
+    ax.legend(loc='upper left')
+    plt.tight_layout()
+    plt.show()
+
+def find_goal_area_shots(tracks, team_id=515):
+    """
+    Find shots towards goal area - using broader detection to catch all shot types
+    """
+    shots_towards_goal = []
+    
+    # FIRST HALF - attacking towards +x (look for x > 45 to catch blocked shots)
+    first_half = tracks[tracks['period'] == 1]
+    ball_towards_goal_1st = first_half[
+        (first_half['player_id'] == -1) &
+        (first_half['pos_x'] > 45) &  # Broader area to catch blocked shots
+        (first_half['possessing_team_id'] == team_id)
+    ]
+    
+    if len(ball_towards_goal_1st) > 0:
+        # Group consecutive frames
+        ball_towards_goal_1st = ball_towards_goal_1st.sort_values('frame_count')
+        ball_towards_goal_1st['group'] = (ball_towards_goal_1st['frame_count'].diff() > 15).cumsum()
+        
+        for group_id, group_df in ball_towards_goal_1st.groupby('group'):
+            start_frame = group_df['frame_count'].min()
+            end_frame = group_df['frame_count'].max()
+            max_x = group_df['pos_x'].max()
+            
+            shot = {
+                'period': 1,
+                'start_frame': start_frame,
+                'end_frame': end_frame,
+                'max_x': max_x,
+                'ball_positions': group_df[['frame_count', 'pos_x', 'pos_y', 'pos_z']].values.tolist(),
+                'attacking_direction': 'positive_x'
+            }
+            shots_towards_goal.append(shot)
+    
+    # SECOND HALF - attacking towards -x (look for x < -45 to catch blocked shots)
+    second_half = tracks[tracks['period'] == 2]
+    ball_towards_goal_2nd = second_half[
+        (second_half['player_id'] == -1) &
+        (second_half['pos_x'] < -45) &  # Broader area to catch blocked shots
+        (second_half['possessing_team_id'] == team_id)
+    ]
+    
+    if len(ball_towards_goal_2nd) > 0:
+        # Group consecutive frames
+        ball_towards_goal_2nd = ball_towards_goal_2nd.sort_values('frame_count')
+        ball_towards_goal_2nd['group'] = (ball_towards_goal_2nd['frame_count'].diff() > 15).cumsum()
+        
+        for group_id, group_df in ball_towards_goal_2nd.groupby('group'):
+            start_frame = group_df['frame_count'].min()
+            end_frame = group_df['frame_count'].max()
+            min_x = group_df['pos_x'].min()
+            
+            shot = {
+                'period': 2,
+                'start_frame': start_frame,
+                'end_frame': end_frame,
+                'min_x': min_x,
+                'ball_positions': group_df[['frame_count', 'pos_x', 'pos_y', 'pos_z']].values.tolist(),
+                'attacking_direction': 'negative_x'
+            }
+            shots_towards_goal.append(shot)
+    
+    return shots_towards_goal
+
+def classify_shot_outcome_comprehensive(shot):
+    """
+    Classify shot outcome: Goal, Blocked, or Saved (based on your working code)
+    """
+    goal_width = 7.32
+    goal_height = 2.44
+    goal_y_min = -goal_width/2  # -3.66
+    goal_y_max = goal_width/2   # +3.66
+    
+    period = shot['period']
+    crossed_goal_line = False
+    goal_line_crossings = []
+    
+    # Check if ball crossed goal line and get positions
+    for frame_count, pos_x, pos_y, pos_z in shot['ball_positions']:
+        if period == 1 and pos_x >= 52.5:  # First half goal line
+            crossed_goal_line = True
+            goal_line_crossings.append((pos_y, pos_z))
+        elif period == 2 and pos_x <= -52.5:  # Second half goal line
+            crossed_goal_line = True
+            goal_line_crossings.append((pos_y, pos_z))
+    
+    if crossed_goal_line:
+        # Ball crossed goal line - check where
+        for pos_y, pos_z in goal_line_crossings:
+            if goal_y_min <= pos_y <= goal_y_max and pos_z <= goal_height:
+                return 'Goal'
+            else:
+                return 'Saved'  # Crossed goal line but saved by keeper
+    else:
+        # Ball didn't cross goal line - check how close it got (your logic)
+        if period == 1 and shot.get('max_x', 0) > 50:  # Got close to goal in first half
+            return 'Saved'  # Ball got close but was saved
+        elif period == 2 and shot.get('min_x', 0) < -50:  # Got close to goal in second half
+            return 'Saved'  # Ball got close but was saved
+        else:
+            return 'Blocked'  # Ball was blocked before getting close
+
+def check_player_involvement_broad(tracks, shot, player_id=3531, lookback_frames=75):
+    """
+    Check if player 3531 was the LAST player to touch the ball IMMEDIATELY before shot sequence
+    """
+    start_frame = shot['start_frame']
+    period = shot['period']
+    
+    # Look back only 3 seconds (75 frames at 25fps) - must be immediate involvement
+    analysis_start = start_frame - lookback_frames
+    analysis_end = start_frame - 1  # Stop just before shot sequence
+    
+    period_data = tracks[tracks['period'] == period]
+    analysis_frames = range(analysis_start, analysis_end + 1)
+    
+    # Get player and ball data for this window
+    player_data = period_data[
+        (period_data['player_id'] == player_id) &
+        (period_data['frame_count'].isin(analysis_frames))
+    ]
+    
+    ball_data = period_data[
+        (period_data['player_id'] == -1) &
+        (period_data['frame_count'].isin(analysis_frames))
+    ]
+    
+    if len(player_data) == 0 or len(ball_data) == 0:
+        return False, None, None
+    
+    # Find the LAST time player was very close to ball (within 1.5m for actual touch)
+    close_moments = []
+    
+    for _, player_row in player_data.iterrows():
+        frame = player_row['frame_count']
+        ball_row = ball_data[ball_data['frame_count'] == frame]
+        
+        if len(ball_row) > 0:
+            ball_row = ball_row.iloc[0]
+            distance = np.sqrt((player_row['pos_x'] - ball_row['pos_x'])**2 + 
+                             (player_row['pos_y'] - ball_row['pos_y'])**2)
+            
+            if distance <= 1.5:  # Very close - actual contact with ball
+                close_moments.append((frame, distance))
+    
+    if not close_moments:
+        return False, None, None
+    
+    # Take the LAST close moment (most recent touch before shot)
+    close_moments.sort(key=lambda x: x[0])  # Sort by frame
+    last_touch_frame, last_distance = close_moments[-1]
+    
+    # Additional check: the touch must be within the last 50 frames (2 seconds)
+    if start_frame - last_touch_frame > 50:
+        return False, None, None  # Too long ago, not immediate involvement
+    
+    return True, last_touch_frame, last_distance
+
+def analyze_all_player_3531_shots(tracks):
+    """
+    Find ALL shots by player 3531: Goals, Blocked, and Saved shots
+    """
+    # Step 1: Find all goal line crossings (for definite goals)
+    goal_crossings = find_goal_line_crossings(tracks, team_id=515)
+    
+    # Step 2: Find all shots towards goal (broader detection for blocked/saved)
+    all_shots = find_goal_area_shots(tracks, team_id=515)
+    
+    # Step 2.5: Add specific check for known goals that might be missed
+    known_goal_frames = [166763, 166767, 166678]  # Your identified goal frames
+    
+    for goal_frame in known_goal_frames:
+        # Check if this goal frame is around any of our detected shots
+        found_nearby = False
+        for shot in all_shots:
+            if abs(shot['start_frame'] - goal_frame) < 100:  # Within 100 frames
+                found_nearby = True
+                break
+        
+        if not found_nearby:
+            # Create a shot entry for this goal
+            period_data = tracks[tracks['period'] == 2]  # Your goal was in period 2
+            goal_ball_data = period_data[
+                (period_data['player_id'] == -1) &
+                (period_data['frame_count'] >= goal_frame - 50) &
+                (period_data['frame_count'] <= goal_frame + 50)
+            ]
+            
+            if len(goal_ball_data) > 0:
+                goal_shot = {
+                    'period': 2,
+                    'start_frame': goal_frame - 10,
+                    'end_frame': goal_frame + 10,
+                    'min_x': goal_ball_data['pos_x'].min(),
+                    'ball_positions': goal_ball_data[['frame_count', 'pos_x', 'pos_y', 'pos_z']].values.tolist(),
+                    'attacking_direction': 'negative_x'
+                }
+                all_shots.append(goal_shot)
+    
+    shots = []
+    processed_frame_ranges = []  # Track frame ranges to avoid duplicates
+    
+    # Process goal line crossings first (highest priority)
+    if goal_crossings:
+        for i, crossing in enumerate(goal_crossings, 1):
+            involved, involvement_frame, distance = check_player_3531_involvement(tracks, crossing)
+            
+            if involved:
+                outcome = classify_outcome(crossing)
+                
+                shot_info = {
+                    'shot_number': len(shots) + 1,
+                    'frame_count': involvement_frame,
+                    'goal_crossing_frame': crossing['start_frame'],
+                    'period': crossing['period'],
+                    'outcome': outcome,
+                    'distance_to_ball': distance,
+                    'crossing_data': crossing
+                }
+                
+                shots.append(shot_info)
+                
+                # Mark this frame range as processed (±100 frames)
+                processed_frame_ranges.append((involvement_frame - 100, involvement_frame + 100))
+                
+                # Visualize this shot
+                visualize_crossing(tracks, crossing, (involved, involvement_frame, distance))
+    
+    # Process broader shot detection for blocked/saved shots
+    if all_shots:
+        for shot in all_shots:
+            involved, involvement_frame, distance = check_player_involvement_broad(tracks, shot)
+            
+            if not involved:
+                continue
+            
+            # Check if this shot is already processed (avoid duplicates)
+            is_duplicate = False
+            for start_range, end_range in processed_frame_ranges:
+                if start_range <= involvement_frame <= end_range:
+                    is_duplicate = True
+                    break
+            
+            if is_duplicate:
+                continue
+                
+            outcome = classify_shot_outcome_comprehensive(shot)
+            
+            # Add all outcomes (Goal, Blocked, Saved)
+            shot_info = {
+                'shot_number': len(shots) + 1,
+                'frame_count': involvement_frame,
+                'shot_sequence_frame': shot['start_frame'],
+                'period': shot['period'],
+                'outcome': outcome,
+                'distance_to_ball': distance,
+                'shot_data': shot
+            }
+            
+            shots.append(shot_info)
+            
+            # Mark this frame range as processed
+            processed_frame_ranges.append((involvement_frame - 100, involvement_frame + 100))
+            
+            # Visualize this shot
+            visualize_shot_broad(tracks, shot, (involved, involvement_frame, distance))
+    
+    return shots
+
+def visualize_shot_broad(tracks, shot, player_involvement=None):
+    """
+    Visualize a shot sequence (for blocked/saved shots)
+    """
+    period = shot['period']
+    start_frame = shot['start_frame']
+    end_frame = shot['end_frame']
+    
+    # Get data for visualization (extended window)
+    viz_start = start_frame - 100
+    viz_end = end_frame + 20
+    
+    period_data = tracks[tracks['period'] == period]
+    viz_data = period_data[
+        (period_data['frame_count'] >= viz_start) &
+        (period_data['frame_count'] <= viz_end)
+    ]
+    
+    ball_data = viz_data[viz_data['player_id'] == -1]
+    player_data = viz_data[viz_data['player_id'] == 3531]
+    
+    # Create plot
+    fig, ax = plt.subplots(figsize=(14, 10))
+    draw_pitch(ax)
+    
+    # Plot ball trajectory
+    ax.plot(ball_data['pos_x'], ball_data['pos_y'], 'b-', linewidth=1, alpha=0.7, label='Ball path')
+    
+    # Highlight shot sequence
+    shot_frames = range(start_frame, end_frame + 1)
+    shot_ball = ball_data[ball_data['frame_count'].isin(shot_frames)]
+    ax.scatter(shot_ball['pos_x'], shot_ball['pos_y'], 
+              c='blue', s=60, label='Ball during shot', edgecolor='darkblue', linewidth=1)
+    
+    # Plot player movement
+    if len(player_data) > 0:
+        ax.plot(player_data['pos_x'], player_data['pos_y'], 'r-', linewidth=2, label='Player 3531')
+        
+        # Highlight involvement point if found
+        if player_involvement and player_involvement[0]:  # player_involved = True
+            involvement_frame = player_involvement[1]
+            involvement_distance = player_involvement[2]
+            
+            involvement_player = player_data[player_data['frame_count'] == involvement_frame]
+            involvement_ball = ball_data[ball_data['frame_count'] == involvement_frame]
+            
+            if len(involvement_player) > 0:
+                ax.scatter(involvement_player['pos_x'], involvement_player['pos_y'], 
+                          c='red', s=200, marker='*', label=f'Player involvement (Frame {involvement_frame})',
+                          edgecolor='black', linewidth=2)
+            
+            if len(involvement_ball) > 0:
+                ax.scatter(involvement_ball['pos_x'], involvement_ball['pos_y'], 
+                          c='green', s=150, marker='*', label=f'Ball at involvement ({involvement_distance:.1f}m)',
+                          edgecolor='black', linewidth=1)
+    
+    # Add goal line markers
+    if period == 1:
+        ax.axvline(x=52.5, color='orange', linestyle='--', linewidth=2, alpha=0.7, label='Goal line (52.5)')
+        ax.axvline(x=45, color='yellow', linestyle=':', linewidth=1, alpha=0.7, label='Detection line (45)')
+    else:
+        ax.axvline(x=-52.5, color='orange', linestyle='--', linewidth=2, alpha=0.7, label='Goal line (-52.5)')
+        ax.axvline(x=-45, color='yellow', linestyle=':', linewidth=1, alpha=0.7, label='Detection line (-45)')
+    
+    outcome = classify_shot_outcome_comprehensive(shot)
+    
+    ax.set_title(f"Shot Analysis - Period {period} - Frames {start_frame}-{end_frame} - Outcome: {outcome}", 
+                fontsize=14, fontweight='bold')
+    ax.legend(loc='upper left')
+    plt.tight_layout()
+    plt.show()
+
+tracks = pd.read_csv('intern_test_tracks.csv')
+shots = analyze_all_player_3531_shots(tracks)
