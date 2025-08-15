@@ -834,5 +834,85 @@ def identify_player_shots(tracks: pd.DataFrame, player_id: int = 3531) -> pd.Dat
 
     return pd.DataFrame(shots).sort_values(['period', 'frame_count']).reset_index(drop=True)
 
-tracks = pd.read_csv('intern_test_tracks.csv')
-shots = identify_player_shots(tracks, player_id=3531)
+def resolve_known_event_frames(tracks: pd.DataFrame, approx_events: dict, tolerance_frames: int = 200) -> pd.DataFrame:
+    """Resolve approximate event frames to nearest ball frames and extract context.
+
+    Returns a DataFrame with columns:
+      - approx_label, approx_frame, resolved_frame, period, ball_x, ball_y, ball_z, within_tolerance
+    """
+    ball = tracks[tracks['player_id'] == -1][['period', 'frame_count', 'pos_x', 'pos_y', 'pos_z']].copy()
+    ball = ball.rename(columns={'pos_x': 'ball_x', 'pos_y': 'ball_y'})
+
+    rows = []
+    for label, frames in approx_events.items():
+        for approx in frames:
+            window = ball[(ball['frame_count'] >= approx - tolerance_frames) & (ball['frame_count'] <= approx + tolerance_frames)]
+            if len(window) > 0:
+                # Choose closest by absolute difference
+                idx = (window['frame_count'] - approx).abs().idxmin()
+                resolved = window.loc[idx]
+                within_tolerance = True
+            else:
+                # Fallback to global nearest (no tolerance window found)
+                idx = (ball['frame_count'] - approx).abs().idxmin()
+                resolved = ball.loc[idx]
+                within_tolerance = False
+            rows.append({
+                'approx_label': label,
+                'approx_frame': int(approx),
+                'resolved_frame': int(resolved['frame_count']),
+                'period': int(resolved['period']),
+                'ball_x': float(resolved['ball_x']),
+                'ball_y': float(resolved['ball_y']),
+                'ball_z': float(resolved['pos_z']),
+                'within_tolerance': within_tolerance,
+            })
+    return pd.DataFrame(rows)
+
+def classify_events_at_frames(tracks: pd.DataFrame, events_df: pd.DataFrame, player_id: int = 3531) -> pd.DataFrame:
+    """Classify outcomes at the resolved frames using the v2 classifier.
+
+    Adds a 'model_outcome' column to the provided events DataFrame.
+    """
+    aligned, player_team_id = _align_to_player_attack_v2(tracks, player_id)
+    outcomes = []
+    for row in events_df.itertuples(index=False):
+        res = _classify_one_shot_v2(
+            tracks=tracks,
+            aligned=aligned,
+            player_id=player_id,
+            player_team_id=player_team_id,
+            period=int(row.period),
+            shot_frame=int(row.resolved_frame)
+        )
+        outcomes.append(res.get('outcome', None))
+    out_df = events_df.copy()
+    out_df['model_outcome'] = outcomes
+    return out_df
+
+if __name__ == '__main__':
+    # Load tracks
+    tracks = pd.read_csv('/workspace/tracks_reduced.csv')
+
+    # Identify shots by the player via model logic
+    shots = identify_player_shots(tracks, player_id=3531)
+
+    # Approximate frames provided by user
+    approx_events = {
+        'Goal': [166764],
+        'Saved': [150992, 124965],
+        'Blocked': [100658, 47500],
+        'Off Target': [80500],
+    }
+
+    # Resolve to nearest ball frames and classify with the model
+    resolved = resolve_known_event_frames(tracks, approx_events, tolerance_frames=200)
+    evaluated = classify_events_at_frames(tracks, resolved, player_id=3531)
+
+    # Print quick view
+    cols = ['approx_label', 'approx_frame', 'period', 'resolved_frame', 'ball_x', 'ball_y', 'ball_z', 'within_tolerance', 'model_outcome']
+    print(evaluated[cols])
+
+    # Write outputs for inspection
+    shots.to_csv('/workspace/identified_shots.csv', index=False)
+    evaluated.to_csv('/workspace/resolved_events_with_model.csv', index=False)
