@@ -672,5 +672,167 @@ def visualize_shot_broad(tracks, shot, player_involvement=None):
     plt.tight_layout()
     plt.show()
 
+def _align_to_player_attack_v2(tracks: pd.DataFrame, player_id: int):
+    FPS = 25
+    player = tracks[tracks['player_id'] == player_id][
+        ['period', 'frame_count', 'team_id', 'pos_x', 'pos_y', 'attacking_multiplier']
+    ].rename(columns={'pos_x': 'player_x', 'pos_y': 'player_y', 'attacking_multiplier': 'att_mult'})
+    ball = tracks[tracks['player_id'] == -1][
+        ['period', 'frame_count', 'pos_x', 'pos_y', 'pos_z', 'ball_in_play']
+    ].rename(columns={'pos_x': 'raw_ball_x', 'pos_y': 'raw_ball_y'})
+
+    merged = pd.merge(ball, player[['period', 'frame_count', 'att_mult']], on=['period', 'frame_count'], how='left')
+    merged['ball_x'] = merged['raw_ball_x'] * merged['att_mult']
+    merged['ball_y'] = merged['raw_ball_y'] * merged['att_mult']
+    merged['ball_z'] = merged['pos_z']
+
+    player['player_x'] = player['player_x'] * player['att_mult']
+    player['player_y'] = player['player_y'] * player['att_mult']
+
+    merged = pd.merge(merged, player[['period', 'frame_count', 'player_x', 'player_y']], on=['period', 'frame_count'], how='left')
+
+    merged['dx'] = merged.groupby('period')['ball_x'].diff().fillna(0.0)
+    merged['dy'] = merged.groupby('period')['ball_y'].diff().fillna(0.0)
+    merged['speed_mps'] = np.hypot(merged['dx'], merged['dy']) * FPS
+
+    player_team_id = int(player['team_id'].mode()[0])
+    return merged, player_team_id
+
+
+def _group_attempt_frames_v2(frames: np.ndarray, min_gap: int = 15):
+    frames = np.sort(frames.astype(int))
+    if frames.size == 0:
+        return []
+    attempts = [frames[0]]
+    for f in frames[1:]:
+        if f - attempts[-1] > min_gap:
+            attempts.append(f)
+    return attempts
+
+
+def _classify_one_shot_v2(tracks: pd.DataFrame, aligned: pd.DataFrame, player_id: int, player_team_id: int, period: int, shot_frame: int):
+    FPS = 25
+    GOAL_X = 52.5
+    GOAL_Y_HALF = 7.32 / 2.0
+    GOAL_HEIGHT = 2.44
+    WIDE_BAND = GOAL_Y_HALF + 2.0
+    PEN_EDGE_X = 45.0
+
+    ball_win = aligned[(aligned['period'] == period) & (aligned['frame_count'].between(shot_frame, shot_frame + 200))].copy()
+
+    # stable in-goal crossing (reduce one-frame noise)
+    in_posts = ball_win['ball_y'].abs() <= GOAL_Y_HALF
+    under_bar = ball_win['ball_z'] <= GOAL_HEIGHT
+    beyond_line = ball_win['ball_x'] >= GOAL_X
+    stable_cross = (in_posts & under_bar & beyond_line).rolling(3, min_periods=1).sum() >= 2
+
+    first_stable_cross_idx = None
+    if stable_cross.any():
+        first_stable_cross_idx = int(ball_win.loc[stable_cross].iloc[0]['frame_count'])
+
+    # Opponents aligned to attack for contact checks
+    att_map = tracks[
+        (tracks['player_id'] == player_id) &
+        (tracks['period'] == period) &
+        (tracks['frame_count'].between(shot_frame, shot_frame + 200))
+    ][['frame_count', 'attacking_multiplier']].rename(columns={'attacking_multiplier': 'att_mult'})
+
+    opp = tracks[
+        (tracks['period'] == period) &
+        (tracks['frame_count'].between(shot_frame, shot_frame + 200)) &
+        (tracks['team_id'] != player_team_id) &
+        (tracks['team_id'] != -1)
+    ][['frame_count', 'player_id', 'team_id', 'goalkeeper', 'pos_x', 'pos_y']]
+
+    opp = opp.merge(att_map, on='frame_count', how='left')
+    opp['opp_x'] = opp['pos_x'] * opp['att_mult']
+    opp['opp_y'] = opp['pos_y'] * opp['att_mult']
+
+    ball_xy = ball_win[['frame_count', 'ball_x', 'ball_y']]
+    opp = opp.merge(ball_xy, on='frame_count', how='left')
+    opp['dist'] = np.hypot(opp['opp_x'] - opp['ball_x'], opp['opp_y'] - opp['ball_y'])
+
+    gk = opp[opp['goalkeeper'] == 1]
+    defn = opp[opp['goalkeeper'] == 0]
+
+    gk_contact = gk[(gk['dist'] <= 1.5) & (gk['ball_x'] >= PEN_EDGE_X - 2) & (gk['ball_y'].abs() <= WIDE_BAND + 1.0)]
+    defn_contact = defn[(defn['dist'] <= 1.5)]
+
+    first_gk_contact = int(gk_contact['frame_count'].min()) if not gk_contact.empty else None
+    first_defn_contact = int(defn_contact['frame_count'].min()) if not defn_contact.empty else None
+
+    # If GK contacts before any stable in-goal crossing -> Saved
+    if first_gk_contact is not None and (first_stable_cross_idx is None or first_gk_contact <= first_stable_cross_idx):
+        return {'period': period, 'frame_count': int(shot_frame), 'outcome': 'Saved'}
+
+    # Goal if stable in-goal crossing happens before any GK contact
+    if first_stable_cross_idx is not None:
+        return {'period': period, 'frame_count': int(shot_frame), 'outcome': 'Goal'}
+
+    # If ball crosses goal plane but outside posts/over bar, treat as Off Target unless GK contact
+    crosses_plane = (ball_win['ball_x'] >= GOAL_X).any()
+    near_posts = (ball_win['ball_y'].abs() <= WIDE_BAND).any()
+    over_bar_near = ((ball_win['ball_x'] >= GOAL_X) & (ball_win['ball_y'].abs() <= WIDE_BAND) & (ball_win['ball_z'] > GOAL_HEIGHT)).any()
+
+    if crosses_plane and (not near_posts or over_bar_near):
+        # If GK contact exists despite off-target geometry, prioritize Saved
+        if first_gk_contact is not None:
+            return {'period': period, 'frame_count': int(shot_frame), 'outcome': 'Saved'}
+        return {'period': period, 'frame_count': int(shot_frame), 'outcome': 'Off Target'}
+
+    # Defender block before reaching penalty edge -> Blocked
+    if first_defn_contact is not None:
+        bx_at_block = float(ball_win.loc[ball_win['frame_count'] == first_defn_contact]['ball_x'].iloc[0]) if first_defn_contact in ball_win['frame_count'].values else 0.0
+        if bx_at_block < GOAL_X:
+            return {'period': period, 'frame_count': int(shot_frame), 'outcome': 'Blocked'}
+
+    # Reaching close to goal without contacts -> Off Target
+    max_bx = float(ball_win['ball_x'].max()) if len(ball_win) else 0.0
+    if max_bx >= PEN_EDGE_X:
+        return {'period': period, 'frame_count': int(shot_frame), 'outcome': 'Off Target'}
+
+    return {'period': period, 'frame_count': int(shot_frame), 'outcome': 'Blocked'}
+
+
+def identify_player_shots(tracks: pd.DataFrame, player_id: int = 3531) -> pd.DataFrame:
+    FPS = 25
+    GOAL_X = 52.5
+    GOAL_Y_HALF = 7.32 / 2.0
+    PEN_EDGE_X = 45.0
+
+    aligned, player_team_id = _align_to_player_attack_v2(tracks, player_id)
+
+    cand = aligned.copy()
+    cand['dist_to_player'] = np.hypot(cand['ball_x'] - cand['player_x'], cand['ball_y'] - cand['player_y'])
+
+    future_speed = pd.concat([cand['speed_mps'].shift(-1), cand['speed_mps'].shift(-2)], axis=1).max(axis=1)
+    forward_prog = cand['ball_x'].shift(-8) - cand['ball_x']
+
+    ax = cand['ball_x'].shift(-3) - cand['ball_x']
+    ay = cand['ball_y'].shift(-3) - cand['ball_y']
+    gx = GOAL_X - cand['ball_x']
+    gy = -cand['ball_y']
+    dot = ax * gx + ay * gy
+    cos_theta = dot / (np.hypot(ax, ay) * np.hypot(gx, gy) + 1e-6)
+
+    is_contact = cand['dist_to_player'] <= 1.2
+    is_kick = future_speed >= 4.0
+    is_towards_goal = (forward_prog >= 3.0) & (cos_theta >= 0.7)
+    is_bip = cand['ball_in_play'] == 1
+
+    mask = is_contact & is_kick & is_towards_goal & is_bip
+    cands = cand.loc[mask, ['period', 'frame_count']].sort_values(['period', 'frame_count'])
+
+    attempts = []
+    for period, group in cands.groupby('period'):
+        attempts += [(period, f) for f in _group_attempt_frames_v2(group['frame_count'].to_numpy(), min_gap=15)]
+
+    shots = [
+        _classify_one_shot_v2(tracks, aligned, player_id, player_team_id, period, shot_frame)
+        for period, shot_frame in attempts
+    ]
+
+    return pd.DataFrame(shots).sort_values(['period', 'frame_count']).reset_index(drop=True)
+
 tracks = pd.read_csv('intern_test_tracks.csv')
-shots = analyze_all_player_3531_shots(tracks)
+shots = identify_player_shots(tracks, player_id=3531)
