@@ -834,5 +834,97 @@ def identify_player_shots(tracks: pd.DataFrame, player_id: int = 3531) -> pd.Dat
 
     return pd.DataFrame(shots).sort_values(['period', 'frame_count']).reset_index(drop=True)
 
+def _get_period_for_frame(tracks: pd.DataFrame, frame: int):
+    row = tracks[tracks['frame_count'] == frame]
+    if len(row) == 0:
+        return None
+    return int(row.iloc[0]['period'])
+
+
+def _classify_around_frame(tracks: pd.DataFrame, player_id: int, approx_frame: int, search_back: int = 75, search_forward: int = 25):
+    aligned, player_team_id = _align_to_player_attack_v2(tracks, player_id)
+    period = _get_period_for_frame(tracks, approx_frame)
+    if period is None:
+        return None
+
+    win = aligned[(aligned['period'] == period) & (aligned['frame_count'].between(approx_frame - search_back, approx_frame + search_forward))].copy()
+    if len(win) == 0:
+        return None
+
+    win['dist_to_player'] = np.hypot(win['ball_x'] - win['player_x'], win['ball_y'] - win['player_y'])
+    contact = win[(win['dist_to_player'] <= 1.5) & (win['ball_in_play'] == 1)].sort_values('frame_count')
+
+    if len(contact) > 0:
+        # Prefer last contact before approx_frame, else first contact after
+        before = contact[contact['frame_count'] <= approx_frame]
+        if len(before) > 0:
+            shot_frame = int(before['frame_count'].iloc[-1])
+        else:
+            shot_frame = int(contact['frame_count'].iloc[0])
+    else:
+        shot_frame = int(approx_frame)
+
+    res = _classify_one_shot_v2(tracks, aligned, player_id, player_team_id, period, shot_frame)
+    res['frame_count'] = shot_frame
+    return res
+
+
+def validate_known_events(tracks: pd.DataFrame, shots_df: pd.DataFrame, approx_events: dict, player_id: int = 3531, tolerance: int = 200) -> pd.DataFrame:
+    rows = []
+    for expected_label, frames in approx_events.items():
+        for approx_frame in frames:
+            period = _get_period_for_frame(tracks, approx_frame)
+            matched = None
+            if period is not None and len(shots_df) > 0:
+                sub = shots_df[shots_df['period'] == period].copy()
+                if len(sub) > 0:
+                    sub['delta'] = (sub['frame_count'] - approx_frame).abs()
+                    sub = sub.sort_values('delta')
+                    if len(sub) > 0 and int(sub['delta'].iloc[0]) <= tolerance:
+                        matched = {
+                            'period': int(period),
+                            'expected_label': expected_label,
+                            'approx_frame': int(approx_frame),
+                            'matched_shot_frame': int(sub['frame_count'].iloc[0]),
+                            'delta_frames': int(sub['delta'].iloc[0]),
+                            'detected_outcome': str(sub['outcome'].iloc[0]),
+                            'source': 'detected'
+                        }
+            if matched is None:
+                fallback = _classify_around_frame(tracks, player_id, int(approx_frame))
+                if fallback is not None:
+                    matched = {
+                        'period': int(_get_period_for_frame(tracks, approx_frame)) if _get_period_for_frame(tracks, approx_frame) is not None else -1,
+                        'expected_label': expected_label,
+                        'approx_frame': int(approx_frame),
+                        'matched_shot_frame': int(fallback['frame_count']),
+                        'delta_frames': abs(int(fallback['frame_count']) - int(approx_frame)),
+                        'detected_outcome': str(fallback['outcome']),
+                        'source': 'fallback'
+                    }
+            if matched is None:
+                matched = {
+                    'period': int(period) if period is not None else -1,
+                    'expected_label': expected_label,
+                    'approx_frame': int(approx_frame),
+                    'matched_shot_frame': -1,
+                    'delta_frames': -1,
+                    'detected_outcome': 'N/A',
+                    'source': 'missing'
+                }
+            rows.append(matched)
+    return pd.DataFrame(rows).sort_values(['period', 'approx_frame']).reset_index(drop=True)
+
 tracks = pd.read_csv('intern_test_tracks.csv')
 shots = identify_player_shots(tracks, player_id=3531)
+
+# Known approximate frames from user (frame_count)
+approx_events = {
+    'Goal': [166764],
+    'Saved': [150992, 124965],
+    'Blocked': [100658, 47500],
+    'Off Target': [80500]
+}
+
+validation = validate_known_events(tracks, shots, approx_events, player_id=3531, tolerance=200)
+print(validation)
